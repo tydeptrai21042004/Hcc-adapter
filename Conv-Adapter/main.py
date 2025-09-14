@@ -84,6 +84,8 @@ def get_args_parser():
     parser.add_argument('--min_lr', type=float, default=1e-6, metavar='LR')
     parser.add_argument('--warmup_epochs', type=int, default=0, metavar='N')
     parser.add_argument('--warmup_steps', type=int, default=-1, metavar='N')
+    parser.add_argument('--weight_decay_end', type=float, default=None,
+                        help='Final weight decay for cosine schedule (default: same as --weight_decay)')
 
     # Augmentation parameters
     parser.add_argument('--color_jitter', type=float, default=0.0, metavar='PCT')
@@ -159,14 +161,27 @@ def get_args_parser():
 
 def main(args):
     utils.init_distributed_mode(args)
-    print(args)
+
+    # Device selection with CPU support and fallback if CUDA not available
+    # - If --device cpu: force CPU and disable AMP
+    # - If --device cuda but CUDA missing: fallback to CPU and disable AMP
+    if str(args.device).lower().startswith('cuda'):
+        if not torch.cuda.is_available():
+            print("[Info] CUDA not available — falling back to CPU.")
+            args.device = 'cpu'
+            args.use_amp = False
+    elif str(args.device).lower() == 'cpu':
+        args.use_amp = False
+
     device = torch.device(args.device)
+    print(args)
+    print(f"[Info] Using device: {device}  (AMP={'on' if args.use_amp else 'off'})")
 
     # Seeds
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
-    cudnn.benchmark = True
+    cudnn.benchmark = (device.type == 'cuda')  # True for speed on GPU
 
     dataset_train, args.nb_classes = build_dataset(args=args, is_train=True)
     if args.disable_eval:
@@ -212,7 +227,7 @@ def main(args):
     if dataset_val is not None:
         data_loader_val = torch.utils.data.DataLoader(
             dataset_val, sampler=sampler_val,
-            batch_size=int(1.5 * args.batch_size),
+            batch_size=min(max(1, args.batch_size), 256),
             num_workers=args.num_workers, pin_memory=args.pin_mem, drop_last=False
         )
     else:
@@ -232,11 +247,21 @@ def main(args):
     if args.tuning_method in ('conv', 'adapter', 'hcc'):
         import torchvision
         from torchvision.models.resnet import BasicBlock, Bottleneck
+        from torchvision.models import resnet50, ResNet50_Weights
 
         # 1) Backbone
-        model_backbone = torchvision.models.resnet50(weights='IMAGENET1K_V2')
+        model_backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
         for p_ in model_backbone.parameters():
             p_.requires_grad = False
+        # Keep BN truly frozen: no running-stats updates, no affine grads
+        for m in model_backbone.modules():
+            if isinstance(m, torch.nn.BatchNorm2d):
+                m.eval()
+                if m.affine:
+                    if m.weight is not None:
+                        m.weight.requires_grad = False
+                    if m.bias is not None:
+                        m.bias.requires_grad = False
 
         # 2) Adapters
         if args.tuning_method in ('conv', 'adapter'):
@@ -271,7 +296,7 @@ def main(args):
                     pw_ratio=args.hcc_pw_ratio,
                     residual_scale=args.adapt_scale,
                     gate_init=args.hcc_gate_init,
-                    padding_mode={'reflect':'reflect', 'replicate':'replicate'}.get(args.hcc_padding, 'reflect')
+                    padding_mode={'reflect': 'reflect', 'replicate': 'replicate', 'zeros': 'zeros'}.get(args.hcc_padding, 'reflect')
                 )
                 # mark so the hook knows how to combine
                 m.is_hcc_adapter = True
@@ -367,14 +392,15 @@ def main(args):
     print('Number of trainable params:', n_parameters)
 
     total_batch_size = args.batch_size * args.update_freq * utils.get_world_size()
-    num_training_steps_per_epoch = len(dataset_train) // total_batch_size
+    num_training_steps_per_epoch = max(1, len(dataset_train) // total_batch_size)
     print("LR = %.8f" % args.lr)
     print("Batch size = %d" % total_batch_size)
     print("Update frequent = %d" % args.update_freq)
     print("Number of training examples = %d" % len(dataset_train))
     print("Number of training training per epoch = %d" % num_training_steps_per_epoch)
 
-    if args.distributed:
+    # Use DDP only on CUDA and only if enabled upstream
+    if getattr(args, "distributed", False) and device.type == 'cuda':
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[args.gpu], find_unused_parameters=False)
         model_without_ddp = model.module
@@ -437,7 +463,7 @@ def main(args):
     print("Start training for %d epochs" % args.epochs)
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
+        if getattr(args, "distributed", False):
             data_loader_train.sampler.set_epoch(epoch)
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
@@ -472,7 +498,8 @@ def main(args):
 
             if log_writer is not None:
                 log_writer.update(test_acc1=test_stats['acc1'], head="perf", step=epoch)
-                log_writer.update(test_acc5=test_stats['acc5'], head="perf", step=epoch)
+                if 'acc5' in test_stats:
+                    log_writer.update(test_acc5=test_stats['acc5'], head="perf", step=epoch)
                 log_writer.update(test_loss=test_stats['loss'], head="perf", step=epoch)
 
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
@@ -525,5 +552,6 @@ if __name__ == '__main__':
         args.save_ckpt = False
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    args.data = args.data_path.split('/')[-2]
+    # Name the dataset by the leaf folder of data_path
+    args.data = Path(args.data_path).name
     main(args)
