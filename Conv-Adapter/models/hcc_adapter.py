@@ -1,89 +1,145 @@
+# file: models/hcc_adapter.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-class HartleyCosineConv2d(nn.Module):
+class HCCAdapter(nn.Module):
     """
-    Even-symmetric shift aggregation along H or W with circular/zero padding.
-    Returns a *residual* tensor; caller does: out + scale * residual(out).
+    Hartley–Cosine (even) shift aggregation via depthwise dilated conv.
+    - Axis: 'h', 'w', or 'hw' (sum).
+    - Tie ±m weights; learn per-channel alphas (center + M side taps).
+    - Optional pointwise bottleneck mixing + BN.
+    - Reflect padding by default to avoid wrap artifacts.
     """
-    def __init__(self, h=1, num_shifts=1, axis='h', padding='circular',
-                 per_channel=True, use_center=True):
+    def __init__(
+        self, C, M=1, h=1, axis='hw',
+        per_channel=True, tie_sym=True,
+        use_pw=True, pw_ratio=8, use_bn=True,
+        residual_scale=1.0, gate_init=0.1,
+        padding_mode='reflect'
+    ):
         super().__init__()
-        assert axis in ('h', 'w')
-        assert padding in ('circular', 'zero')
+        assert axis in ('h','w','hw')
+        self.C = C
+        self.M = int(M)
         self.h = int(h)
-        self.M = int(num_shifts)
         self.axis = axis
-        self.padding = padding
+        self.tie_sym = tie_sym
         self.per_channel = per_channel
-        self.use_center = use_center
-        self.weight = None  # lazily built as (C,K) or (K,)
+        self.padding_mode = padding_mode
+        self.residual_scale = residual_scale
 
-    def _ensure_weight(self, C, device):
-        # IMPORTANT: keep parameter in FP32 so grads are FP32 (needed by GradScaler)
-        K = (1 + 2 * self.M) if self.use_center else (2 * self.M)
-        shape = (C, K) if self.per_channel else (K,)
-        if (self.weight is None) or (tuple(self.weight.shape) != shape):
-            w = torch.empty(shape, device=device, dtype=torch.float32)
-            nn.init.xavier_uniform_(w)
-            self.weight = nn.Parameter(w)
+        K = 2*M + 1  # kernel length along axis
+
+        # Learn alpha coefficients: center + M side (shared or per-channel)
+        ncoef = M + 1
+        if per_channel:
+            self.alpha = nn.Parameter(torch.zeros(C, ncoef))
         else:
-            if self.weight.device != device:
-                self.weight.data = self.weight.data.to(device=device)
+            self.alpha = nn.Parameter(torch.zeros(ncoef))
 
-    def _shift_zero(self, x, s, dim):
-        if s == 0:
-            return x
-        if dim == 2:  # H
-            if s > 0:
-                pad = torch.zeros_like(x)[:, :, :s, :]
-                core = x[:, :, :-s, :]
-                return torch.cat([pad, core], dim=2)
+        # Identity-safe init: center ≈ 1, sides ≈ 0
+        with torch.no_grad():
+            if per_channel:
+                self.alpha[:, 0].fill_(1.0)
             else:
-                s = -s
-                pad = torch.zeros_like(x)[:, :, -s:, :]
-                core = x[:, :, s:, :]
-                return torch.cat([core, pad], dim=2)
-        else:         # W
-            if s > 0:
-                pad = torch.zeros_like(x)[:, :, :, :s]
-                core = x[:, :, :, :-s]
-                return torch.cat([pad, core], dim=3)
-            else:
-                s = -s
-                pad = torch.zeros_like(x)[:, :, :, -s:]
-                core = x[:, :, :, s:]
-                return torch.cat([core, pad], dim=3)
+                self.alpha[0] = 1.0
+
+        # Optional channel mixing (DW -> PW bottleneck -> PW expand)
+        self.use_pw = use_pw
+        if use_pw:
+            hid = max(1, C // pw_ratio)
+            self.pw = nn.Sequential(
+                nn.Conv2d(C, hid, 1, bias=False),
+                nn.BatchNorm2d(hid) if use_bn else nn.Identity(),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hid, C, 1, bias=False),
+                nn.BatchNorm2d(C) if use_bn else nn.Identity(),
+            )
+        else:
+            self.pw = nn.Identity()
+
+        # Learnable global gate (can switch to per-channel gate if desired)
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def _build_even_kernel_1d(self, device, dtype):
+        """
+        Build symmetric 1D kernel of length K = 2M+1 from alpha (center + M sides).
+        If per_channel=True, returns weight shape for depthwise conv (C,1,K).
+        Else returns (1,1,K) and we expand to groups=C.
+        """
+        M, C = self.M, self.C
+        K = 2*M + 1
+
+        # Compose full even kernel from alpha [alpha0, alpha1..alphaM]
+        # w[k] = alpha0 at center; alpha_m at ±m positions
+        if self.per_channel:
+            # (C, K)
+            w = torch.zeros(C, K, device=device, dtype=dtype)
+            center = M
+            w[:, center] = self.alpha[:, 0]
+            for m in range(1, M+1):
+                if self.tie_sym:
+                    w[:, center - m] = self.alpha[:, m]
+                    w[:, center + m] = self.alpha[:, m]
+                else:
+                    # If you later store separate +/−, split here
+                    w[:, center - m] = self.alpha[:, m]
+                    w[:, center + m] = self.alpha[:, m]
+            # normalize (optional but recommended)
+            s = w.abs().sum(dim=1, keepdim=True).clamp_min(1e-6)
+            w = w / s
+            # depthwise weight (C,1,K)
+            return w.unsqueeze(1)
+        else:
+            # (K,)
+            w = torch.zeros(K, device=device, dtype=dtype)
+            center = M
+            w[center] = self.alpha[0]
+            for m in range(1, M+1):
+                val = self.alpha[m]
+                if self.tie_sym:
+                    w[center-m] = val
+                    w[center+m] = val
+                else:
+                    w[center-m] = val
+                    w[center+m] = val
+            s = w.abs().sum().clamp_min(1e-6)
+            w = w / s
+            # expand to depthwise (C,1,K)
+            return w.view(1,1,K).repeat(self.C, 1, 1)
+
+    def _pad(self, x, pad_h, pad_w):
+        if self.padding_mode == 'reflect':
+            return F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode='reflect')
+        elif self.padding_mode == 'replicate':
+            return F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode='replicate')
+        else:
+            # 'zeros'
+            return F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode='constant', value=0.0)
 
     def forward(self, x):
-        """
-        x: (N,C,H,W)  ->  residual: (N,C,H,W)
-        """
-        C = x.size(1)
-        self._ensure_weight(C, device=x.device)
+        B, C, H, W = x.shape
+        w1d = self._build_even_kernel_1d(x.device, x.dtype)  # (C,1,K)
 
-        # Build even-symmetric shifts: [0, +h, -h, +2h, -2h, ...]
-        shifts = [0] if self.use_center else []
-        for m in range(1, self.M + 1):
-            s = m * self.h
-            shifts.extend([+s, -s])
+        y = 0
+        K = 2*self.M + 1
+        if 'h' in self.axis:
+            # depthwise conv along height -> kernel size (K,1), dilation (h,1)
+            wh = w1d.view(self.C, 1, K, 1)
+            xh = self._pad(x, pad_h=self.M*self.h, pad_w=0)
+            yh = F.conv2d(xh, wh, bias=None, stride=1, padding=0,
+                          dilation=(self.h, 1), groups=self.C)
+            y = y + yh
 
-        dim = 2 if self.axis == 'h' else 3
-        bank = []
-        for s in shifts:
-            if self.padding == 'circular':
-                bank.append(torch.roll(x, shifts=s, dims=dim))
-            else:
-                bank.append(self._shift_zero(x, s, dim))
-        X = torch.stack(bank, dim=-1)  # (N,C,H,W,K)
+        if 'w' in self.axis:
+            # depthwise conv along width -> kernel size (1,K), dilation (1,h)
+            ww = w1d.view(self.C, 1, 1, K)
+            xw = self._pad(x, pad_h=0, pad_w=self.M*self.h)
+            yw = F.conv2d(xw, ww, bias=None, stride=1, padding=0,
+                          dilation=(1, self.h), groups=self.C)
+            y = y + yw
 
-        # Compute with a casted view (keeps leaf param in FP32 for FP32 grads)
-        if self.per_channel:
-            Wc = self.weight.view(1, C, 1, 1, -1)
-        else:
-            Wc = self.weight.view(1, 1, 1, 1, -1)
-        if Wc.dtype != X.dtype:
-            Wc = Wc.to(X.dtype)
-
-        residual = (X * Wc).sum(dim=-1)  # (N,C,H,W)
-        return residual
+        # Residual + optional PW mixing + gate
+        y = self.pw(y)
+        return x + self.residual_scale * self.gate * y
