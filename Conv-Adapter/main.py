@@ -35,6 +35,18 @@ def str2bool(v):
 def get_args_parser():
     parser = argparse.ArgumentParser('Parameter Efficient Tuning', add_help=False)
 
+    # --- New: backbone + weights selection (torchvision multi-weight API) ---
+    parser.add_argument('--backbone', type=str, default='resnet50',
+                        help="Any torchvision classification model name, e.g. "
+                             "resnet18|resnet50|resnext50_32x4d|wide_resnet50_2|"
+                             "mobilenet_v3_large|efficientnet_b0|convnext_tiny")
+    parser.add_argument('--weights', type=str, default='DEFAULT',
+                        help="Torchvision weights to load. "
+                             "Examples: DEFAULT, none, IMAGENET1K_V1, "
+                             "ResNet50_Weights.IMAGENET1K_V2, EfficientNet_B0_Weights.IMAGENET1K_V1")
+    parser.add_argument('--list_backbones', action='store_true',
+                        help='Print available torchvision model names and exit.')
+
     parser.add_argument('--tuning_method', type=str, default='prompt',
                         help='prompt | adapter | conv | hcc')
 
@@ -63,7 +75,7 @@ def get_args_parser():
 
     # Model parameters
     parser.add_argument('--model', default='resnet50_clip', type=str, metavar='MODEL',
-                        help='Name of model to train')
+                        help='Name of model to train (only used when not using PET shim)')
     parser.add_argument('--drop_path', type=float, default=0, metavar='PCT',
                         help='Drop path rate (default: 0.0)')
     parser.add_argument('--input_size', default=224, type=int, help='image input size')
@@ -159,12 +171,63 @@ def get_args_parser():
     return parser
 
 
+def _resolve_weights_multiapi(backbone: str, weights_str: str):
+    """
+    Resolve torchvision weights across versions:
+      - For modern API: use get_model_weights / get_weight
+      - Accept 'none' / 'scratch' / '' -> None
+      - Accept 'DEFAULT' or named enum members (IMAGENET1K_V1, etc.)
+      - Accept fully qualified names like 'ResNet50_Weights.IMAGENET1K_V2'
+    """
+    try:
+        from torchvision.models import get_model_weights, get_weight
+        has_new_api = True
+    except Exception:
+        has_new_api = False
+
+    if not weights_str or str(weights_str).lower() in ('none', 'scratch', 'random'):
+        return None, has_new_api
+
+    if not has_new_api:
+        # Old API: we'll treat anything not 'none' as pretrained=True
+        return 'legacy_pretrained', False
+
+    # New API path
+    if '.' in weights_str:
+        # Fully-qualified enum path
+        from torchvision.models import get_weight
+        return get_weight(weights_str), True
+
+    # Try enum for this backbone
+    from torchvision.models import get_model_weights
+    try:
+        enum_cls = get_model_weights(backbone)
+        member = weights_str.upper()
+        if member == 'DEFAULT':
+            return enum_cls.DEFAULT, True
+        if hasattr(enum_cls, member):
+            return getattr(enum_cls, member), True
+    except Exception:
+        pass
+    return None, True
+
+
 def main(args):
+    # Early: handle --list_backbones
+    if args.list_backbones:
+        try:
+            from torchvision.models import list_models
+            names = list_models()
+            for n in sorted(n for n in names if not n.startswith("video")):
+                print(n)
+        except Exception as e:
+            print(f"[Warn] list_backbones failed: {e}")
+            print("Hint: your torchvision may be too old for list_models().")
+        return
+
     utils.init_distributed_mode(args)
 
     # Device selection with CPU support and fallback if CUDA not available
-    # - If --device cpu: force CPU and disable AMP
-    # - If --device cuda but CUDA missing: fallback to CPU and disable AMP
     if str(args.device).lower().startswith('cuda'):
         if not torch.cuda.is_available():
             print("[Info] CUDA not available — falling back to CPU.")
@@ -243,19 +306,35 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=args.nb_classes
         )
 
-    # === BEGIN: PET SHIM (conv/adapter/hcc) ===
+    # === BEGIN: General PET SHIM (supports many torchvision backbones) ===
     if args.tuning_method in ('conv', 'adapter', 'hcc'):
         import torchvision
-        from torchvision.models.resnet import BasicBlock, Bottleneck
-        from torchvision.models import resnet50, ResNet50_Weights
 
-        # 1) Backbone
-        model_backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+        # Resolve weights across TV versions
+        tv_weights, has_new_api = _resolve_weights_multiapi(args.backbone, args.weights)
+        print(f"[Info] Backbone={args.backbone} | weights={args.weights} -> {tv_weights}")
+
+        # Build backbone
+        try:
+            if has_new_api:
+                from torchvision.models import get_model
+                model_backbone = get_model(args.backbone, weights=tv_weights)
+            else:
+                # Legacy API
+                fn = getattr(torchvision.models, args.backbone)
+                pretrained = (tv_weights == 'legacy_pretrained')
+                try:
+                    model_backbone = fn(pretrained=pretrained, num_classes=1000)
+                except TypeError:
+                    model_backbone = fn(pretrained=pretrained)
+        except AttributeError as e:
+            raise RuntimeError(f"Backbone '{args.backbone}' is not available in your torchvision.") from e
+
+        # Freeze backbone (including BN)
         for p_ in model_backbone.parameters():
             p_.requires_grad = False
-        # Keep BN truly frozen: no running-stats updates, no affine grads
         for m in model_backbone.modules():
-            if isinstance(m, torch.nn.BatchNorm2d):
+            if isinstance(m, nn.BatchNorm2d):
                 m.eval()
                 if m.affine:
                     if m.weight is not None:
@@ -263,7 +342,7 @@ def main(args):
                     if m.bias is not None:
                         m.bias.requires_grad = False
 
-        # 2) Adapters
+        # --- Adapters ---
         if args.tuning_method in ('conv', 'adapter'):
             class ConvAdapter(nn.Module):
                 def __init__(self, c, k=args.kernel_size):
@@ -279,11 +358,8 @@ def main(args):
 
             def make_adapter(ch):
                 return ConvAdapter(ch)
-
         else:
-            # HCC adapter (full residual add inside the module)
             from models.hcc_adapter import HCCAdapter
-
             def make_adapter(ch):
                 m = HCCAdapter(
                     C=ch,
@@ -298,33 +374,111 @@ def main(args):
                     gate_init=args.hcc_gate_init,
                     padding_mode={'reflect': 'reflect', 'replicate': 'replicate', 'zeros': 'zeros'}.get(args.hcc_padding, 'reflect')
                 )
-                # mark so the hook knows how to combine
                 m.is_hcc_adapter = True
                 return m
 
-        # 3) Attach adapters via forward hooks
-        def attach(block, out_ch):
-            block.add_module('pet_adapter', make_adapter(out_ch))
+        # --- Attach adapters by family ---
+        from torchvision.models.resnet import BasicBlock, Bottleneck
+        try:
+            from torchvision.models.convnext import CNBlock
+        except Exception:
+            CNBlock = tuple()
+        try:
+            from torchvision.models.efficientnet import MBConv, FusedMBConv
+        except Exception:
+            MBConv = FusedMBConv = tuple()
+        try:
+            from torchvision.models.mobilenetv3 import InvertedResidual
+        except Exception:
+            InvertedResidual = tuple()
 
+        def _attach(module: nn.Module, out_ch: int):
+            module.add_module('pet_adapter', make_adapter(out_ch))
             def hook(mod, _in, out):
-                # HCC returns x + residual; ConvAdapter returns residual only
                 if getattr(mod.pet_adapter, 'is_hcc_adapter', False):
-                    return mod.pet_adapter(out)
+                    return mod.pet_adapter(out)          # HCC returns x + residual internally
                 else:
                     return out + args.adapt_scale * mod.pet_adapter(out)
+            module.register_forward_hook(hook)
 
-            block.register_forward_hook(hook)
+        for m in model_backbone.modules():
+            # ResNet family
+            if isinstance(m, Bottleneck):
+                _attach(m, m.conv3.out_channels)
+            elif isinstance(m, BasicBlock):
+                _attach(m, m.conv2.out_channels)
+            # ConvNeXt
+            elif CNBlock and isinstance(m, CNBlock):
+                # Prefer dwconv if present
+                if hasattr(m, 'dwconv') and isinstance(m.dwconv, nn.Conv2d):
+                    out_ch = m.dwconv.out_channels
+                elif hasattr(m, 'block') and len(getattr(m, 'block')) > 0 and isinstance(m.block[0], nn.Conv2d):
+                    out_ch = m.block[0].out_channels
+                else:
+                    continue
+                _attach(m, out_ch)
+            # EfficientNet v1/v2
+            elif MBConv and isinstance(m, (MBConv, FusedMBConv)):
+                out_ch = getattr(m, 'out_channels', None)
+                if out_ch is None:
+                    # fallback: last conv in block
+                    last_conv = None
+                    for c in m.modules():
+                        if isinstance(c, nn.Conv2d):
+                            last_conv = c
+                    if last_conv is None:
+                        continue
+                    out_ch = last_conv.out_channels
+                _attach(m, out_ch)
+            # MobileNetV3
+            elif InvertedResidual and isinstance(m, InvertedResidual):
+                out_ch = getattr(m, 'out_channels', None)
+                if out_ch is None:
+                    last_conv = None
+                    for c in m.modules():
+                        if isinstance(c, nn.Conv2d):
+                            last_conv = c
+                    if last_conv is None:
+                        continue
+                    out_ch = last_conv.out_channels
+                _attach(m, out_ch)
 
-        for mm in model_backbone.modules():
-            if isinstance(mm, Bottleneck):
-                attach(mm, mm.conv3.out_channels)
-            elif isinstance(mm, BasicBlock):
-                attach(mm, mm.conv2.out_channels)
+        # --- Replace classifier head to match nb_classes ---
+        def _replace_classifier(model: nn.Module, num_classes: int):
+            # Common patterns across torchvision models
+            if hasattr(model, 'fc') and isinstance(model.fc, nn.Linear):
+                in_f = model.fc.in_features
+                model.fc = nn.Linear(in_f, num_classes)
+                return
 
-        # 4) Trainable head
-        model_backbone.fc = nn.Linear(model_backbone.fc.in_features, args.nb_classes)
-        for p_ in model_backbone.fc.parameters():
-            p_.requires_grad = True
+            if hasattr(model, 'classifier'):
+                head = model.classifier
+                if isinstance(head, nn.Linear):
+                    model.classifier = nn.Linear(head.in_features, num_classes)
+                    return
+                if isinstance(head, nn.Sequential):
+                    new_seq = list(head)
+                    # replace last Linear in the Sequential
+                    last_lin_idx = None
+                    for i in reversed(range(len(new_seq))):
+                        if isinstance(new_seq[i], nn.Linear):
+                            last_lin_idx = i
+                            break
+                    if last_lin_idx is not None:
+                        in_f = new_seq[last_lin_idx].in_features
+                        new_seq[last_lin_idx] = nn.Linear(in_f, num_classes)
+                        model.classifier = nn.Sequential(*new_seq)
+                        return
+
+            # Fallback (rare): try attribute named 'head' or 'heads'
+            for attr in ('head', 'heads'):
+                if hasattr(model, attr) and isinstance(getattr(model, attr), nn.Linear):
+                    lin = getattr(model, attr)
+                    setattr(model, attr, nn.Linear(lin.in_features, num_classes))
+                    return
+            raise RuntimeError("Couldn't find a classifier head to replace for this backbone.")
+
+        _replace_classifier(model_backbone, args.nb_classes)
 
         model = model_backbone
     else:
@@ -336,7 +490,7 @@ def main(args):
             tuning_method=args.tuning_method,
             args=args,
         )
-    # === END: PET SHIM ===
+    # === END: General PET SHIM ===
 
     # Move to device BEFORE profiling
     model.to(device)
@@ -405,7 +559,7 @@ def main(args):
             model, device_ids=[args.gpu], find_unused_parameters=False)
         model_without_ddp = model.module
 
-    # -------- Optimizer with param-groups (0 WD for HCC) --------
+    # -------- Optimizer with param-groups (0 WD for HCC/adapters) --------
     hcc_params, other_params = [], []
     for n, p in model_without_ddp.named_parameters():
         if not p.requires_grad:
@@ -422,7 +576,7 @@ def main(args):
         ],
         betas=(0.9, 0.999), eps=args.opt_eps
     )
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------------------
 
     loss_scaler = NativeScaler()  # engine.py handles amp context
 
@@ -546,6 +700,13 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('ConvNeXt training and evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
+
+    # Early exit if just listing backbones
+    if args.list_backbones:
+        # call main which handles printing and returning
+        main(args)
+        raise SystemExit(0)
+
     if not args.is_tuning:
         args = utils.auto_load_optim_param(args, args.model, args.tuning_method, args.dataset)
     else:
